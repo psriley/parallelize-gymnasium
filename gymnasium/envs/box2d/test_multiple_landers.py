@@ -12,7 +12,7 @@ from gymnasium.error import DependencyNotInstalled
 from gymnasium.utils import EzPickle, colorize
 from gymnasium.utils.step_api_compatibility import step_api_compatibility
 
-from multiprocessing import Pool
+from multiprocessing import Pool, current_process
 
 try:
     import Box2D
@@ -859,11 +859,19 @@ def heuristic(env, s):
             a = 1
     return a
 
-
-def demo_heuristic_lander(env, seed=None, render=False):
+def init_process(env):
+    # Initialize the environment in each process
+    global process_env
+    process_env = env
+    
+def demo_heuristic_lander(args):
     total_reward = 0
     steps = 0
+    env, seed, render = args
+
     s, info = env.reset(seed=seed)
+    current_pid = current_process().pid
+
     while True:
         a = heuristic(env, s)
         s, r, terminated, truncated, info = step_api_compatibility(env.step(a), True)
@@ -886,8 +894,10 @@ def demo_heuristic_lander(env, seed=None, render=False):
                 break
 
         if steps % 20 == 0 or terminated or truncated:
+            print(f"Process ID: {current_pid}")
             print("observations:", " ".join([f"{x:+0.2f}" for x in s]))
             print(f"step {steps} total_reward {total_reward:+0.2f}")
+            print("====================================")
         steps += 1
         if terminated or truncated:
             break
@@ -910,7 +920,16 @@ class LunarLanderContinuous:
 
 
 if __name__ == "__main__":
-    env = gym.make("LunarLander-v2", render_mode="rgb_array")
-    with Pool() as pool:
-        pool.map(demo_heuristic_lander, [env, None, True] * NUM_PROCESSES)
+    env = LunarLander(render_mode="rgb_array")
+
+    # Run the demo with the heuristic function
+    # demo_heuristic_lander((env, None, True))
+
+    # env = gym.make("LunarLander-v2", render_mode="rgb_array")
+    
+    with Pool(initializer=init_process, initargs=(env,)) as pool:
+        args_list = [(env, None, True) for _ in range(NUM_PROCESSES)]
+        pool.map(demo_heuristic_lander, args_list)
+        
+#         pool.map(demo_heuristic_lander, [env, None, True] * NUM_PROCESSES)
     # demo_heuristic_lander(env, render=True)

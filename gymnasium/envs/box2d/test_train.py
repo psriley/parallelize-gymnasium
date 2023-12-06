@@ -918,7 +918,7 @@ def train():
     # evaluate_policy(model, env, n_eval_episodes=1, render=True)
 
 def run_trained_model(env, load_model=False):
-    # train()
+    train()
 
     # # Load the trained agent
     # if not load_model:
