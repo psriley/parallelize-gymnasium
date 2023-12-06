@@ -12,7 +12,7 @@ from gymnasium.error import DependencyNotInstalled
 from gymnasium.utils import EzPickle, colorize
 from gymnasium.utils.step_api_compatibility import step_api_compatibility
 
-from multiprocessing import Pool, current_process
+from multiprocessing import Pool, Process, current_process
 
 try:
     import Box2D
@@ -57,7 +57,7 @@ MAIN_ENGINE_Y_LOCATION = (
 VIEWPORT_W = 600
 VIEWPORT_H = 400
 
-NUM_PROCESSES = 4
+NUM_PROCESSES = 1
 
 
 class ContactDetector(contactListener):
@@ -66,19 +66,25 @@ class ContactDetector(contactListener):
         self.env = env
 
     def BeginContact(self, contact):
-        if (
-            self.env.lander == contact.fixtureA.body
-            or self.env.lander == contact.fixtureB.body
-        ):
-            self.env.game_over = True
-        for i in range(2):
-            if self.env.legs[i] in [contact.fixtureA.body, contact.fixtureB.body]:
-                self.env.legs[i].ground_contact = True
+        for lander_info in self.env.landers:
+            lander = lander_info["body"]
+            legs = lander_info["legs"]
+
+            if lander == contact.fixtureA.body or lander == contact.fixtureB.body:
+                self.env.game_over = True
+
+            for leg in legs:
+                if leg == contact.fixtureA.body or leg == contact.fixtureB.body:
+                    leg.ground_contact = True
 
     def EndContact(self, contact):
-        for i in range(2):
-            if self.env.legs[i] in [contact.fixtureA.body, contact.fixtureB.body]:
-                self.env.legs[i].ground_contact = False
+        for lander_info in self.env.landers:
+            legs = lander_info["legs"]
+
+            for leg in legs:
+                if leg == contact.fixtureA.body or leg == contact.fixtureB.body:
+                    leg.ground_contact = False
+
 
 
 class LunarLander(gym.Env, EzPickle):
@@ -279,7 +285,7 @@ class LunarLander(gym.Env, EzPickle):
         self.isopen = True
         self.world = Box2D.b2World(gravity=(0, gravity))
         self.moon = None
-        self.lander: Optional[Box2D.b2Body] = None
+        self.landers = [] # list to hold multiple landers
         self.particles = []
 
         self.prev_reward = None
@@ -340,10 +346,85 @@ class LunarLander(gym.Env, EzPickle):
         self._clean_particles(True)
         self.world.DestroyBody(self.moon)
         self.moon = None
-        self.world.DestroyBody(self.lander)
-        self.lander = None
-        self.world.DestroyBody(self.legs[0])
-        self.world.DestroyBody(self.legs[1])
+        for lander in self.landers:
+            self.world.DestroyBody(lander.body)
+            self.world.DestroyBody(lander.legs[0])
+            self.world.DestroyBody(lander.legs[1])
+        self.landers = []
+        
+
+    def _create_landers(self, num_landers=1):
+        initial_y = VIEWPORT_H / SCALE
+        initial_x = VIEWPORT_W / SCALE / 2
+
+        for _ in range(num_landers):
+            lander = self.world.CreateDynamicBody(
+                position=(initial_x, initial_y),
+                angle=0.0,
+                fixtures=fixtureDef(
+                    shape=polygonShape(
+                        vertices=[(x / SCALE, y / SCALE) for x, y in LANDER_POLY]
+                    ),
+                    density=5.0,
+                    friction=0.1,
+                    categoryBits=0x0010,
+                    maskBits=0x001,  # collide only with ground
+                    restitution=0.0,
+                ),
+            )
+
+            lander.color1 = (255, 0, 0)
+            lander.color2 = (0, 0, 0)
+
+            lander.ApplyForceToCenter(
+                (
+                    self.np_random.uniform(-INITIAL_RANDOM, INITIAL_RANDOM),
+                    self.np_random.uniform(-INITIAL_RANDOM, INITIAL_RANDOM),
+                ),
+                True,
+            )
+
+            legs = []
+            for i in [-1, +1]:
+                leg = self.world.CreateDynamicBody(
+                    position=(initial_x - i * LEG_AWAY / SCALE, initial_y),
+                    angle=(i * 0.05),
+                    fixtures=fixtureDef(
+                        shape=polygonShape(box=(LEG_W / SCALE, LEG_H / SCALE)),
+                        density=1.0,
+                        restitution=0.0,
+                        categoryBits=0x0020,
+                        maskBits=0x001,
+                    ),
+                )
+                leg.ground_contact = False
+                leg.color1 = (128, 102, 230)
+                leg.color2 = (77, 77, 128)
+                rjd = revoluteJointDef(
+                    bodyA=lander,
+                    bodyB=leg,
+                    localAnchorA=(0, 0),
+                    localAnchorB=(i * LEG_AWAY / SCALE, LEG_DOWN / SCALE),
+                    enableMotor=True,
+                    enableLimit=True,
+                    maxMotorTorque=LEG_SPRING_TORQUE,
+                    motorSpeed=+0.3 * i,
+                )
+                if i == -1:
+                    rjd.lowerAngle = +0.9 - 0.5
+                    rjd.upperAngle = +0.9
+                else:
+                    rjd.lowerAngle = -0.9
+                    rjd.upperAngle = -0.9 + 0.5
+                leg.joint = self.world.CreateJoint(rjd)
+                legs.append(leg)
+
+            self.landers.append({"body": lander, "legs": legs})
+
+        # Update drawlist with all lander bodies and legs
+        self.drawlist = [item["body"] for item in self.landers] + [
+            leg for item in self.landers for leg in item["legs"]
+        ]
 
     def reset(
         self,
@@ -391,74 +472,11 @@ class LunarLander(gym.Env, EzPickle):
         self.moon.color1 = (0.0, 0.0, 0.0)
         self.moon.color2 = (0.0, 0.0, 0.0)
 
-        # Create Lander body
-        initial_y = VIEWPORT_H / SCALE
-        initial_x = VIEWPORT_W / SCALE / 2
-        self.lander: Box2D.b2Body = self.world.CreateDynamicBody(
-            position=(initial_x, initial_y),
-            angle=0.0,
-            fixtures=fixtureDef(
-                shape=polygonShape(
-                    vertices=[(x / SCALE, y / SCALE) for x, y in LANDER_POLY]
-                ),
-                density=5.0,
-                friction=0.1,
-                categoryBits=0x0010,
-                maskBits=0x001,  # collide only with ground
-                restitution=0.0,
-            ),  # 0.99 bouncy
-        )
-        self.lander.color1 = (128, 102, 230)
-        self.lander.color2 = (77, 77, 128)
-
-        # Apply the initial random impulse to the lander
-        self.lander.ApplyForceToCenter(
-            (
-                self.np_random.uniform(-INITIAL_RANDOM, INITIAL_RANDOM),
-                self.np_random.uniform(-INITIAL_RANDOM, INITIAL_RANDOM),
-            ),
-            True,
-        )
-
-        # Create Lander Legs
-        self.legs = []
-        for i in [-1, +1]:
-            leg = self.world.CreateDynamicBody(
-                position=(initial_x - i * LEG_AWAY / SCALE, initial_y),
-                angle=(i * 0.05),
-                fixtures=fixtureDef(
-                    shape=polygonShape(box=(LEG_W / SCALE, LEG_H / SCALE)),
-                    density=1.0,
-                    restitution=0.0,
-                    categoryBits=0x0020,
-                    maskBits=0x001,
-                ),
-            )
-            leg.ground_contact = False
-            leg.color1 = (128, 102, 230)
-            leg.color2 = (77, 77, 128)
-            rjd = revoluteJointDef(
-                bodyA=self.lander,
-                bodyB=leg,
-                localAnchorA=(0, 0),
-                localAnchorB=(i * LEG_AWAY / SCALE, LEG_DOWN / SCALE),
-                enableMotor=True,
-                enableLimit=True,
-                maxMotorTorque=LEG_SPRING_TORQUE,
-                motorSpeed=+0.3 * i,  # low enough not to jump back into the sky
-            )
-            if i == -1:
-                rjd.lowerAngle = (
-                    +0.9 - 0.5
-                )  # The most esoteric numbers here, angled legs have freedom to travel within
-                rjd.upperAngle = +0.9
-            else:
-                rjd.lowerAngle = -0.9
-                rjd.upperAngle = -0.9 + 0.5
-            leg.joint = self.world.CreateJoint(rjd)
-            self.legs.append(leg)
-
-        self.drawlist = [self.lander] + self.legs
+        self._create_landers(2)
+        
+        # p = Process(target=self._create_lander)
+        # p.start()
+        # p.join()
 
         if self.render_mode == "human":
             self.render()
@@ -487,192 +505,195 @@ class LunarLander(gym.Env, EzPickle):
             self.world.DestroyBody(self.particles.pop(0))
 
     def step(self, action):
-        assert self.lander is not None
+        assert self.landers is not None
 
         # Update wind and apply to the lander
-        assert self.lander is not None, "You forgot to call reset()"
-        if self.enable_wind and not (
-            self.legs[0].ground_contact or self.legs[1].ground_contact
-        ):
-            # the function used for wind is tanh(sin(2 k x) + sin(pi k x)),
-            # which is proven to never be periodic, k = 0.01
-            wind_mag = (
-                math.tanh(
-                    math.sin(0.02 * self.wind_idx)
-                    + (math.sin(math.pi * 0.01 * self.wind_idx))
+        assert self.landers is not None, "You forgot to call reset()"
+
+        for lander in self.landers:
+            if self.enable_wind and not (
+                lander['legs'][0].ground_contact or lander['legs'][1].ground_contact
+            ):
+                # the function used for wind is tanh(sin(2 k x) + sin(pi k x)),
+                # which is proven to never be periodic, k = 0.01
+                wind_mag = (
+                    math.tanh(
+                        math.sin(0.02 * self.wind_idx)
+                        + (math.sin(math.pi * 0.01 * self.wind_idx))
+                    )
+                    * self.wind_power
                 )
-                * self.wind_power
-            )
-            self.wind_idx += 1
-            self.lander.ApplyForceToCenter(
-                (wind_mag, 0.0),
-                True,
-            )
+                self.wind_idx += 1
+                lander['body'].ApplyForceToCenter(
+                    (wind_mag, 0.0),
+                    True,
+                )
 
-            # the function used for torque is tanh(sin(2 k x) + sin(pi k x)),
-            # which is proven to never be periodic, k = 0.01
-            torque_mag = math.tanh(
-                math.sin(0.02 * self.torque_idx)
-                + (math.sin(math.pi * 0.01 * self.torque_idx))
-            ) * (self.turbulence_power)
-            self.torque_idx += 1
-            self.lander.ApplyTorque(
-                (torque_mag),
-                True,
-            )
+                # the function used for torque is tanh(sin(2 k x) + sin(pi k x)),
+                # which is proven to never be periodic, k = 0.01
+                torque_mag = math.tanh(
+                    math.sin(0.02 * self.torque_idx)
+                    + (math.sin(math.pi * 0.01 * self.torque_idx))
+                ) * (self.turbulence_power)
+                self.torque_idx += 1
+                lander['body'].ApplyTorque(
+                    (torque_mag),
+                    True,
+                )
 
-        if self.continuous:
-            action = np.clip(action, -1, +1).astype(np.float32)
-        else:
-            assert self.action_space.contains(
-                action
-            ), f"{action!r} ({type(action)}) invalid "
-
-        # Apply Engine Impulses
-
-        # Tip is a the (X and Y) components of the rotation of the lander.
-        tip = (math.sin(self.lander.angle), math.cos(self.lander.angle))
-
-        # Side is the (-Y and X) components of the rotation of the lander.
-        side = (-tip[1], tip[0])
-
-        # Generate two random numbers between -1/SCALE and 1/SCALE.
-        dispersion = [self.np_random.uniform(-1.0, +1.0) / SCALE for _ in range(2)]
-
-        m_power = 0.0
-        if (self.continuous and action[0] > 0.0) or (
-            not self.continuous and action == 2
-        ):
-            # Main engine
             if self.continuous:
-                m_power = (np.clip(action[0], 0.0, 1.0) + 1.0) * 0.5  # 0.5..1.0
-                assert m_power >= 0.5 and m_power <= 1.0
+                action = np.clip(action, -1, +1).astype(np.float32)
             else:
-                m_power = 1.0
+                assert self.action_space.contains(
+                    action
+                ), f"{action!r} ({type(action)}) invalid "
 
-            # 4 is move a bit downwards, +-2 for randomness
-            # The components of the impulse to be applied by the main engine.
-            ox = (
-                tip[0] * (MAIN_ENGINE_Y_LOCATION / SCALE + 2 * dispersion[0])
-                + side[0] * dispersion[1]
-            )
-            oy = (
-                -tip[1] * (MAIN_ENGINE_Y_LOCATION / SCALE + 2 * dispersion[0])
-                - side[1] * dispersion[1]
-            )
+            # Apply Engine Impulses
 
-            impulse_pos = (self.lander.position[0] + ox, self.lander.position[1] + oy)
-            if self.render_mode is not None:
-                # particles are just a decoration, with no impact on the physics, so don't add them when not rendering
-                p = self._create_particle(
-                    3.5,  # 3.5 is here to make particle speed adequate
-                    impulse_pos[0],
-                    impulse_pos[1],
-                    m_power,
+            # Tip is a the (X and Y) components of the rotation of the lander.
+            tip = (math.sin(lander['body'].angle), math.cos(lander['body'].angle))
+
+            # Side is the (-Y and X) components of the rotation of the lander.
+            side = (-tip[1], tip[0])
+
+            # Generate two random numbers between -1/SCALE and 1/SCALE.
+            dispersion = [self.np_random.uniform(-1.0, +1.0) / SCALE for _ in range(2)]
+
+            m_power = 0.0
+            if (self.continuous and action[0] > 0.0) or (
+                not self.continuous and action == 2
+            ):
+                # Main engine
+                if self.continuous:
+                    m_power = (np.clip(action[0], 0.0, 1.0) + 1.0) * 0.5  # 0.5..1.0
+                    assert m_power >= 0.5 and m_power <= 1.0
+                else:
+                    m_power = 1.0
+
+                # 4 is move a bit downwards, +-2 for randomness
+                # The components of the impulse to be applied by the main engine.
+                ox = (
+                    tip[0] * (MAIN_ENGINE_Y_LOCATION / SCALE + 2 * dispersion[0])
+                    + side[0] * dispersion[1]
                 )
-                p.ApplyLinearImpulse(
-                    (
-                        ox * MAIN_ENGINE_POWER * m_power,
-                        oy * MAIN_ENGINE_POWER * m_power,
-                    ),
+                oy = (
+                    -tip[1] * (MAIN_ENGINE_Y_LOCATION / SCALE + 2 * dispersion[0])
+                    - side[1] * dispersion[1]
+                )
+
+                impulse_pos = (lander['body'].position[0] + ox, lander['body'].position[1] + oy)
+                if self.render_mode is not None:
+                    # particles are just a decoration, with no impact on the physics, so don't add them when not rendering
+                    p = self._create_particle(
+                        3.5,  # 3.5 is here to make particle speed adequate
+                        impulse_pos[0],
+                        impulse_pos[1],
+                        m_power,
+                    )
+                    p.ApplyLinearImpulse(
+                        (
+                            ox * MAIN_ENGINE_POWER * m_power,
+                            oy * MAIN_ENGINE_POWER * m_power,
+                        ),
+                        impulse_pos,
+                        True,
+                    )
+                lander['body'].ApplyLinearImpulse(
+                    (-ox * MAIN_ENGINE_POWER * m_power, -oy * MAIN_ENGINE_POWER * m_power),
                     impulse_pos,
                     True,
                 )
-            self.lander.ApplyLinearImpulse(
-                (-ox * MAIN_ENGINE_POWER * m_power, -oy * MAIN_ENGINE_POWER * m_power),
-                impulse_pos,
-                True,
-            )
 
-        s_power = 0.0
-        if (self.continuous and np.abs(action[1]) > 0.5) or (
-            not self.continuous and action in [1, 3]
-        ):
-            # Orientation/Side engines
-            if self.continuous:
-                direction = np.sign(action[1])
-                s_power = np.clip(np.abs(action[1]), 0.5, 1.0)
-                assert s_power >= 0.5 and s_power <= 1.0
-            else:
-                # action = 1 is left, action = 3 is right
-                direction = action - 2
-                s_power = 1.0
+            s_power = 0.0
+            if (self.continuous and np.abs(action[1]) > 0.5) or (
+                not self.continuous and action in [1, 3]
+            ):
+                # Orientation/Side engines
+                if self.continuous:
+                    direction = np.sign(action[1])
+                    s_power = np.clip(np.abs(action[1]), 0.5, 1.0)
+                    assert s_power >= 0.5 and s_power <= 1.0
+                else:
+                    # action = 1 is left, action = 3 is right
+                    direction = action - 2
+                    s_power = 1.0
 
-            # The components of the impulse to be applied by the side engines.
-            ox = tip[0] * dispersion[0] + side[0] * (
-                3 * dispersion[1] + direction * SIDE_ENGINE_AWAY / SCALE
-            )
-            oy = -tip[1] * dispersion[0] - side[1] * (
-                3 * dispersion[1] + direction * SIDE_ENGINE_AWAY / SCALE
-            )
+                # The components of the impulse to be applied by the side engines.
+                ox = tip[0] * dispersion[0] + side[0] * (
+                    3 * dispersion[1] + direction * SIDE_ENGINE_AWAY / SCALE
+                )
+                oy = -tip[1] * dispersion[0] - side[1] * (
+                    3 * dispersion[1] + direction * SIDE_ENGINE_AWAY / SCALE
+                )
 
-            # The constant 17 is a constant, that is presumably meant to be SIDE_ENGINE_HEIGHT.
-            # However, SIDE_ENGINE_HEIGHT is defined as 14
-            # This casuses the position of the thurst on the body of the lander to change, depending on the orientation of the lander.
-            # This in turn results in an orientation depentant torque being applied to the lander.
-            impulse_pos = (
-                self.lander.position[0] + ox - tip[0] * 17 / SCALE,
-                self.lander.position[1] + oy + tip[1] * SIDE_ENGINE_HEIGHT / SCALE,
-            )
-            if self.render_mode is not None:
-                # particles are just a decoration, with no impact on the physics, so don't add them when not rendering
-                p = self._create_particle(0.7, impulse_pos[0], impulse_pos[1], s_power)
-                p.ApplyLinearImpulse(
-                    (
-                        ox * SIDE_ENGINE_POWER * s_power,
-                        oy * SIDE_ENGINE_POWER * s_power,
-                    ),
+                # The constant 17 is a constant, that is presumably meant to be SIDE_ENGINE_HEIGHT.
+                # However, SIDE_ENGINE_HEIGHT is defined as 14
+                # This casuses the position of the thurst on the body of the lander to change, depending on the orientation of the lander.
+                # This in turn results in an orientation depentant torque being applied to the lander.
+                impulse_pos = (
+                    lander['body'].position[0] + ox - tip[0] * 17 / SCALE,
+                    lander['body'].position[1] + oy + tip[1] * SIDE_ENGINE_HEIGHT / SCALE,
+                )
+                if self.render_mode is not None:
+                    # particles are just a decoration, with no impact on the physics, so don't add them when not rendering
+                    p = self._create_particle(0.7, impulse_pos[0], impulse_pos[1], s_power)
+                    p.ApplyLinearImpulse(
+                        (
+                            ox * SIDE_ENGINE_POWER * s_power,
+                            oy * SIDE_ENGINE_POWER * s_power,
+                        ),
+                        impulse_pos,
+                        True,
+                    )
+                lander['body'].ApplyLinearImpulse(
+                    (-ox * SIDE_ENGINE_POWER * s_power, -oy * SIDE_ENGINE_POWER * s_power),
                     impulse_pos,
                     True,
                 )
-            self.lander.ApplyLinearImpulse(
-                (-ox * SIDE_ENGINE_POWER * s_power, -oy * SIDE_ENGINE_POWER * s_power),
-                impulse_pos,
-                True,
-            )
 
         self.world.Step(1.0 / FPS, 6 * 30, 2 * 30)
 
-        pos = self.lander.position
-        vel = self.lander.linearVelocity
+        for lander in self.landers:
+            pos = lander['body'].position
+            vel = lander['body'].linearVelocity
 
-        state = [
-            (pos.x - VIEWPORT_W / SCALE / 2) / (VIEWPORT_W / SCALE / 2),
-            (pos.y - (self.helipad_y + LEG_DOWN / SCALE)) / (VIEWPORT_H / SCALE / 2),
-            vel.x * (VIEWPORT_W / SCALE / 2) / FPS,
-            vel.y * (VIEWPORT_H / SCALE / 2) / FPS,
-            self.lander.angle,
-            20.0 * self.lander.angularVelocity / FPS,
-            1.0 if self.legs[0].ground_contact else 0.0,
-            1.0 if self.legs[1].ground_contact else 0.0,
-        ]
-        assert len(state) == 8
+            state = [
+                (pos.x - VIEWPORT_W / SCALE / 2) / (VIEWPORT_W / SCALE / 2),
+                (pos.y - (self.helipad_y + LEG_DOWN / SCALE)) / (VIEWPORT_H / SCALE / 2),
+                vel.x * (VIEWPORT_W / SCALE / 2) / FPS,
+                vel.y * (VIEWPORT_H / SCALE / 2) / FPS,
+                lander['body'].angle,
+                20.0 * lander['body'].angularVelocity / FPS,
+                1.0 if lander['legs'][0].ground_contact else 0.0,
+                1.0 if lander['legs'][1].ground_contact else 0.0,
+            ]
+            assert len(state) == 8
 
-        reward = 0
-        shaping = (
-            -100 * np.sqrt(state[0] * state[0] + state[1] * state[1])
-            - 100 * np.sqrt(state[2] * state[2] + state[3] * state[3])
-            - 100 * abs(state[4])
-            + 10 * state[6]
-            + 10 * state[7]
-        )  # And ten points for legs contact, the idea is if you
-        # lose contact again after landing, you get negative reward
-        if self.prev_shaping is not None:
-            reward = shaping - self.prev_shaping
-        self.prev_shaping = shaping
+            reward = 0
+            shaping = (
+                -100 * np.sqrt(state[0] * state[0] + state[1] * state[1])
+                - 100 * np.sqrt(state[2] * state[2] + state[3] * state[3])
+                - 100 * abs(state[4])
+                + 10 * state[6]
+                + 10 * state[7]
+            )  # And ten points for legs contact, the idea is if you
+            # lose contact again after landing, you get negative reward
+            if self.prev_shaping is not None:
+                reward = shaping - self.prev_shaping
+            self.prev_shaping = shaping
 
-        reward -= (
-            m_power * 0.30
-        )  # less fuel spent is better, about -30 for heuristic landing
-        reward -= s_power * 0.03
+            reward -= (
+                m_power * 0.30
+            )  # less fuel spent is better, about -30 for heuristic landing
+            reward -= s_power * 0.03
 
-        terminated = False
-        if self.game_over or abs(state[0]) >= 1.0:
-            terminated = True
-            reward = -100
-        if not self.lander.awake:
-            terminated = True
-            reward = +100
+            terminated = False
+            if self.game_over or abs(state[0]) >= 1.0:
+                terminated = True
+                reward = -100
+            if not lander['body'].awake:
+                terminated = True
+                reward = +100
 
         if self.render_mode == "human":
             self.render()
@@ -920,7 +941,7 @@ class LunarLanderContinuous:
 
 
 if __name__ == "__main__":
-    env = LunarLander(render_mode="rgb_array")
+    env = LunarLander(render_mode="human")
 
     # Run the demo with the heuristic function
     # demo_heuristic_lander((env, None, True))
